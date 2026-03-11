@@ -4,6 +4,8 @@ import { LRUCache } from 'lru-cache';
 import cron, { type ScheduledTask } from 'node-cron';
 import { JwtTrackingDb } from './jwt-tracking';
 
+/** Reusable tag for plugin log messages (e.g. for filtering in log aggregation). */
+const LOG_TAG = '[verdaccio-github-oauth-verifier]';
 
 interface AuthConfig {
   "github-oauth-ui"?: {
@@ -48,7 +50,7 @@ class GithubOAuthVerifierMiddleware {
 
   constructor(config: PluginConfig | undefined, stuff: PluginStuff) {
     this.stuff = stuff;
-    this.stuff.logger.info('[verdaccio-github-oauth-verifier] Configuring');
+    this.stuff.logger.info(`${LOG_TAG} Configuring`);
 
     this.enabled = config != null && config.enabled !== false;
     this.cache = new LRUCache({ max: 1000, ttl: config?.cacheTTLMinutes ? config.cacheTTLMinutes * 60 * 1000 : 1000 * 60 * 60 * 8 });
@@ -58,12 +60,12 @@ class GithubOAuthVerifierMiddleware {
     const raw = config?.jwtCleanupSchedule?.trim();
     this.jwtCleanupSchedule = raw && raw.length > 0 ? raw : '0 0 * * *';
     if (this.jwtTracking) {
-      this.stuff.logger.info('[verdaccio-github-oauth-verifier] JWT tracking DB enabled (only most recent token per user)');
+      this.stuff.logger.info(`${LOG_TAG} JWT tracking DB enabled (only most recent token per user)`);
       this.scheduleCleanup();
     }
 
     if (!this.enabled) {
-      this.stuff.logger.info('[verdaccio-github-oauth-verifier] Disabled');
+      this.stuff.logger.info(`${LOG_TAG} Disabled`);
       this.token = '';
       this.org = '';
       return;
@@ -72,7 +74,7 @@ class GithubOAuthVerifierMiddleware {
     this.token = config?.auth?.['github-oauth-ui']?.token ?? '';
     this.org = config?.org ?? '';
     if (!this.token || !this.org) {
-      this.stuff.logger.error('[verdaccio-github-oauth-verifier] Token or org is missing, disabling plugin');
+      this.stuff.logger.error(`${LOG_TAG} Token or org is missing, disabling plugin`);
       return;
     }
   }
@@ -82,16 +84,16 @@ class GithubOAuthVerifierMiddleware {
     const runCleanup = (): void => {
       try {
         this.jwtTracking?.deleteExpired();
-        this.stuff.logger.info('[verdaccio-github-oauth-verifier] JWT tracking: expired entries cleaned up');
+        this.stuff.logger.info(`${LOG_TAG} JWT tracking: expired entries cleaned up`);
       } catch (err) {
-        this.stuff.logger.error(`[verdaccio-github-oauth-verifier] JWT tracking cleanup failed: ${err}`);
+        this.stuff.logger.error(`${LOG_TAG} JWT tracking cleanup failed: ${err}`);
       }
     };
 
     let expression = this.jwtCleanupSchedule;
     if (!cron.validate(expression)) {
       this.stuff.logger.warn(
-        `[verdaccio-github-oauth-verifier] Invalid jwtCleanupSchedule "${expression}", using default "0 0 * * *"`
+        `${LOG_TAG} Invalid jwtCleanupSchedule "${expression}", using default "0 0 * * *"`
       );
       expression = '0 0 * * *';
     }
@@ -112,12 +114,12 @@ class GithubOAuthVerifierMiddleware {
     }
 
     if (!this.token || !this.org) {
-      this.stuff.logger.error('[verdaccio-github-oauth-verifier] Token or org is missing, skipping middleware setup');
+      this.stuff.logger.error(`${LOG_TAG} Token or org is missing, skipping middleware setup`);
       return;
     }
 
     this.stuff.logger.info(
-      `[verdaccio-github-oauth-verifier] register_middlewares loaded`
+      `${LOG_TAG} register_middlewares loaded`
     );
 
     if (app.post) {
@@ -132,7 +134,7 @@ class GithubOAuthVerifierMiddleware {
           }
           this.jwtTracking?.setRevoked(username);
           this.cache.delete(username);
-          this.stuff.logger.info(`[verdaccio-github-oauth-verifier] JWT invalidated for user: ${username}`);
+          this.stuff.logger.info(`${LOG_TAG} JWT invalidated for user: ${username}`);
           res.status(200).json({ ok: true, message: `JWT invalidated for user: ${username}` });
         }
       );
@@ -143,11 +145,11 @@ class GithubOAuthVerifierMiddleware {
           const username = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
           if (username) {
             this.cache.delete(username);
-            this.stuff.logger.info(`[verdaccio-github-oauth-verifier] Cache cleared for user: ${username}`);
+            this.stuff.logger.info(`${LOG_TAG} Cache cleared for user: ${username}`);
             res.status(200).json({ ok: true, message: `Cache cleared for user: ${username}` });
           } else {
             this.cache.clear();
-            this.stuff.logger.info('[verdaccio-github-oauth-verifier] Entire cache cleared');
+            this.stuff.logger.info(`${LOG_TAG} Entire cache cleared`);
             res.status(200).json({ ok: true, message: 'Entire cache cleared' });
           }
         }
@@ -211,7 +213,7 @@ class GithubOAuthVerifierMiddleware {
 
         this.cache.set(username, true);
       } catch (error) {
-        this.stuff.logger.error(`[verdaccio-github-oauth-verifier] Error verifying token: ${error}`);
+        this.stuff.logger.error(`${LOG_TAG} Error verifying token: ${error}`);
       }
 
       next();
@@ -239,16 +241,16 @@ class GithubOAuthVerifierMiddleware {
       
       // 404 means they were removed or never existed
       if (response.status === 404) {
-        console.warn(`User ${username} is no longer in the ${orgName} organization.`);
+        this.stuff.logger.warn(`${LOG_TAG} User ${username} is no longer in the ${orgName} organization.`);
         return false;
       }
 
       // Log unexpected statuses (e.g., 401 Unauthorized if your token expires, or 403 Rate Limit)
-      console.error(`GitHub API returned status ${response.status} when checking ${username}`);
+      this.stuff.logger.error(`${LOG_TAG} GitHub API returned status ${response.status} when checking ${username}`);
       return false;
 
     } catch (error) {
-      console.error('Failed to communicate with GitHub API', error);
+      this.stuff.logger.error(`${LOG_TAG} Failed to communicate with GitHub API: ${error}`);
       // Fail closed: if we can't verify them, assume they don't have access
       return false; 
     }
