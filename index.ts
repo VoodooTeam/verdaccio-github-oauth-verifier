@@ -4,7 +4,15 @@ import { LRUCache } from 'lru-cache';
 import cron, { type ScheduledTask } from 'node-cron';
 import { JwtTrackingDb } from './jwt-tracking';
 
+
+interface AuthConfig {
+  "github-oauth-ui"?: {
+    token?: string;
+  };
+}
+
 interface PluginConfig {
+  auth?: AuthConfig;
   enabled?: boolean;
   token?: string;
   org?: string;
@@ -60,8 +68,8 @@ class GithubOAuthVerifierMiddleware {
       this.org = '';
       return;
     }
-
-    this.token = config?.token ?? '';
+    
+    this.token = config?.auth?.['github-oauth-ui']?.token ?? '';
     this.org = config?.org ?? '';
     if (!this.token || !this.org) {
       this.stuff.logger.error('[verdaccio-github-oauth-verifier] Token or org is missing, disabling plugin');
