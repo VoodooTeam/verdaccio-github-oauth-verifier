@@ -20,19 +20,6 @@ interface PluginStuff {
   };
 }
 
-interface StorageConfig {
-  config: {
-    secret?: string;
-    security?: {
-      api?: {
-        jwt?: {
-          secret?: string;
-        };
-      };
-    };
-  };
-}
-
 class GithubOAuthVerifierMiddleware {
   private readonly stuff: PluginStuff;
   private readonly enabled: boolean;
@@ -71,9 +58,12 @@ class GithubOAuthVerifierMiddleware {
 
   // eslint-disable-next-line camelcase
   register_middlewares(
-    app: { use: (fn: (req: Request, res: Response, next: NextFunction) => void) => void },
+    app: {
+      use: (fn: (req: Request, res: Response, next: NextFunction) => void) => void;
+      post?: (path: string, ...handlers: Array<(req: Request, res: Response, next: NextFunction) => void>) => void;
+    },
     _authInstance: unknown,
-    storageInstance: StorageConfig
+    storageInstance: unknown
   ): void {
     if (!this.enabled) {
       return;
@@ -88,9 +78,39 @@ class GithubOAuthVerifierMiddleware {
       `[verdaccio-github-oauth-verifier] register_middlewares loaded`
     );
 
-    const globalConfig = storageInstance.config;
-    const verdaccioSecret =
-      globalConfig.security?.api?.jwt?.secret ?? globalConfig.secret;
+    if (app.post) {
+      app.post(
+        '/-/github-oauth-verifier/invalidate-jwt',
+        (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
+        (req: Request, res: Response) => {
+          const username = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
+          if (!username) {
+            res.status(400).json({ error: 'Missing query parameter: username' });
+            return;
+          }
+          this.jwtTracking?.setRevoked(username);
+          this.cache.delete(username);
+          this.stuff.logger.info(`[verdaccio-github-oauth-verifier] JWT invalidated for user: ${username}`);
+          res.status(200).json({ ok: true, message: `JWT invalidated for user: ${username}` });
+        }
+      );
+      app.post(
+        '/-/github-oauth-verifier/clear-cache',
+        (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
+        (req: Request, res: Response) => {
+          const username = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
+          if (username) {
+            this.cache.delete(username);
+            this.stuff.logger.info(`[verdaccio-github-oauth-verifier] Cache cleared for user: ${username}`);
+            res.status(200).json({ ok: true, message: `Cache cleared for user: ${username}` });
+          } else {
+            this.cache.clear();
+            this.stuff.logger.info('[verdaccio-github-oauth-verifier] Entire cache cleared');
+            res.status(200).json({ ok: true, message: 'Entire cache cleared' });
+          }
+        }
+      );
+    }
 
     app.use(async (req: Request, res: Response, next: NextFunction) => {
       if (!req.headers?.authorization) {
@@ -150,7 +170,6 @@ class GithubOAuthVerifierMiddleware {
         }
 
         this.cache.set(username, true);
-        this.stuff.logger.info(`[verdaccio-github-oauth-verifier] ${username}`);
       } catch (error) {
         this.stuff.logger.error(`[verdaccio-github-oauth-verifier] Error verifying token: ${error}`);
       }
@@ -160,40 +179,54 @@ class GithubOAuthVerifierMiddleware {
   }
 
   private async verifyUserInGitHubApp(username: string): Promise<boolean> {
-  const orgName = this.org; // e.g., 'my-company-org'
-  const token = this.token; // Your configured admin token
-  
-  try {
-    const response = await fetch(`https://api.github.com/orgs/${orgName}/members/${username}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/vnd.github.v3+json',
-        'X-GitHub-Api-Version': '2022-11-28'
-      }
-    });
-
-    // 204 means the user is confirmed as a member
-    if (response.status === 204) {
-      return true; 
-    }
+    const orgName = this.org; // e.g., 'my-company-org'
+    const token = this.token; // Your configured admin token
     
-    // 404 means they were removed or never existed
-    if (response.status === 404) {
-      console.warn(`User ${username} is no longer in the ${orgName} organization.`);
+    try {
+      const response = await fetch(`https://api.github.com/orgs/${orgName}/members/${username}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      });
+
+      // 204 means the user is confirmed as a member
+      if (response.status === 204) {
+        return true; 
+      }
+      
+      // 404 means they were removed or never existed
+      if (response.status === 404) {
+        console.warn(`User ${username} is no longer in the ${orgName} organization.`);
+        return false;
+      }
+
+      // Log unexpected statuses (e.g., 401 Unauthorized if your token expires, or 403 Rate Limit)
+      console.error(`GitHub API returned status ${response.status} when checking ${username}`);
       return false;
+
+    } catch (error) {
+      console.error('Failed to communicate with GitHub API', error);
+      // Fail closed: if we can't verify them, assume they don't have access
+      return false; 
     }
-
-    // Log unexpected statuses (e.g., 401 Unauthorized if your token expires, or 403 Rate Limit)
-    console.error(`GitHub API returned status ${response.status} when checking ${username}`);
-    return false;
-
-  } catch (error) {
-    console.error('Failed to communicate with GitHub API', error);
-    // Fail closed: if we can't verify them, assume they don't have access
-    return false; 
   }
-}
+
+  private requireAdminToken(req: Request, res: Response, next: NextFunction): void {
+    const auth = req.headers?.authorization;
+    if (!auth || !auth.startsWith('Bearer ')) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header (Bearer token required)' });
+      return;
+    }
+    const token = auth.slice(7);
+    if (token !== this.token) {
+      res.status(403).json({ error: 'Invalid admin token' });
+      return;
+    }
+    next();
+  }
 }
 
 function plugin(config: PluginConfig | undefined, stuff: PluginStuff): GithubOAuthVerifierMiddleware {
