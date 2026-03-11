@@ -13,6 +13,6 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["index.ts"],
+  "include": ["index.ts", "jwt-tracking.ts"],
   "exclude": ["node_modules", "dist"]
 }

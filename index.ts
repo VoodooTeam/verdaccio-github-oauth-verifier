@@ -1,12 +1,15 @@
 import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
-import { LRUCache } from 'lru-cache'
+import { LRUCache } from 'lru-cache';
+import { JwtTrackingDb } from './jwt-tracking';
 
 interface PluginConfig {
   enabled?: boolean;
   token?: string;
   org?: string;
   cacheTTLMinutes?: number;
+  /** Path to SQLite DB for JWT tracking (e.g. ./jwt-tracking.db). When set, only the most recent JWT per user is allowed. */
+  jwtTrackingDbPath?: string;
 }
 
 interface PluginStuff {
@@ -36,6 +39,7 @@ class GithubOAuthVerifierMiddleware {
   private readonly token: string;
   private readonly org: string;
   private readonly cache: LRUCache<string, boolean>;
+  private readonly jwtTracking: JwtTrackingDb | null;
 
   constructor(config: PluginConfig | undefined, stuff: PluginStuff) {
     this.stuff = stuff;
@@ -44,11 +48,16 @@ class GithubOAuthVerifierMiddleware {
     this.enabled = config != null && config.enabled !== false;
     this.cache = new LRUCache({ max: 1000, ttl: config?.cacheTTLMinutes ? config.cacheTTLMinutes * 60 * 1000 : 1000 * 60 * 60 * 8 });
 
+    const dbPath = config?.jwtTrackingDbPath;
+    this.jwtTracking = dbPath ? new JwtTrackingDb(dbPath) : null;
+    if (this.jwtTracking) {
+      this.stuff.logger.info('[verdaccio-github-oauth-verifier] JWT tracking DB enabled (only most recent token per user)');
+    }
+
     if (!this.enabled) {
       this.stuff.logger.info('[verdaccio-github-oauth-verifier] Disabled');
       this.token = '';
       this.org = '';
-      
       return;
     }
 
@@ -88,16 +97,43 @@ class GithubOAuthVerifierMiddleware {
         return next();
       }
 
-      const token = req.headers.authorization.split(' ')[1];      
+      const token = req.headers.authorization.split(' ')[1];
 
-      try
-      {
+      try {
         const tokenParts = token.split('.');
         if (tokenParts.length !== 3) return next();
 
         const payloadBase64 = tokenParts[1];
         const decodedPayload = JSON.parse(Buffer.from(payloadBase64, 'base64').toString('utf8'));
         const username = decodedPayload.name;
+        const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;
+        const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
+
+        if (this.jwtTracking) {
+          this.jwtTracking.deleteExpired();
+
+          const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+          const latest = this.jwtTracking.getLatest(username);
+
+          if (latest !== null && latest.revoked) {
+            const isSameToken = latest.token_hash === tokenHash && latest.iat === iat;
+            if (isSameToken) {
+              return res.status(401).json({ error: 'GitHub authorization revoked' });
+            }
+          }
+
+          if (exp !== null && exp < Math.floor(Date.now() / 1000)) {
+            this.jwtTracking.deleteUser(username);
+            return res.status(401).json({ error: 'JWT token has expired' });
+          }
+
+          if (latest !== null && !latest.revoked && iat < latest.iat) {
+            return res.status(401).json({ error: 'JWT token has been superseded by a newer login' });
+          }
+
+          const expForDb = exp !== null ? exp : 2147483647; // no expiry → far future for cleanup
+          this.jwtTracking.setLatest(username, tokenHash, iat, expForDb, 0);
+        }
 
         if (this.cache.has(username)) {
           if (this.cache.get(username) === false) {
@@ -109,18 +145,12 @@ class GithubOAuthVerifierMiddleware {
         const isUserInGitHubApp = await this.verifyUserInGitHubApp(username);
         if (!isUserInGitHubApp) {
           this.cache.set(username, false);
+          this.jwtTracking?.setRevoked(username);
           return res.status(401).json({ error: 'GitHub authorization revoked' });
         }
 
         this.cache.set(username, true);
-
-        console.log(
-          '[verdaccio-github-oauth-ui] Plugin initialized. Full JWT:', 
-          JSON.stringify(decodedPayload, null, 2)
-        );
-
-        this.stuff.logger.info(`[verdaccio-github-oauth-verifier] ${username}`)
-
+        this.stuff.logger.info(`[verdaccio-github-oauth-verifier] ${username}`);
       } catch (error) {
         this.stuff.logger.error(`[verdaccio-github-oauth-verifier] Error verifying token: ${error}`);
       }
