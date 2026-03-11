@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { LRUCache } from 'lru-cache';
+import cron, { type ScheduledTask } from 'node-cron';
 import { JwtTrackingDb } from './jwt-tracking';
 
 interface PluginConfig {
@@ -10,6 +11,12 @@ interface PluginConfig {
   cacheTTLMinutes?: number;
   /** Path to SQLite DB for JWT tracking (e.g. ./jwt-tracking.db). When set, only the most recent JWT per user is allowed. */
   jwtTrackingDbPath?: string;
+  /**
+   * Cron expression for JWT tracking cleanup. Default: '0 0 * * *' (daily at midnight).
+   * Format: minute hour day-of-month month day-of-week (5 fields), or second + those 5 (6 fields).
+   * Examples: '0 0 * * *' midnight daily, '0 0 * * * *' every minute at 0 sec, every N seconds use 6-field cron.
+   */
+  jwtCleanupSchedule?: string;
 }
 
 interface PluginStuff {
@@ -27,6 +34,9 @@ class GithubOAuthVerifierMiddleware {
   private readonly org: string;
   private readonly cache: LRUCache<string, boolean>;
   private readonly jwtTracking: JwtTrackingDb | null;
+  /** Cron expression for cleanup. Default '0 0 * * *'. */
+  private readonly jwtCleanupSchedule: string;
+  private cleanupTask: ScheduledTask | null = null;
 
   constructor(config: PluginConfig | undefined, stuff: PluginStuff) {
     this.stuff = stuff;
@@ -37,8 +47,11 @@ class GithubOAuthVerifierMiddleware {
 
     const dbPath = config?.jwtTrackingDbPath;
     this.jwtTracking = dbPath ? new JwtTrackingDb(dbPath) : null;
+    const raw = config?.jwtCleanupSchedule?.trim();
+    this.jwtCleanupSchedule = raw && raw.length > 0 ? raw : '0 0 * * *';
     if (this.jwtTracking) {
       this.stuff.logger.info('[verdaccio-github-oauth-verifier] JWT tracking DB enabled (only most recent token per user)');
+      this.scheduleCleanup();
     }
 
     if (!this.enabled) {
@@ -54,6 +67,27 @@ class GithubOAuthVerifierMiddleware {
       this.stuff.logger.error('[verdaccio-github-oauth-verifier] Token or org is missing, disabling plugin');
       return;
     }
+  }
+
+  /** Schedules JWT cleanup using cron expression (jwtCleanupSchedule). */
+  private scheduleCleanup(): void {
+    const runCleanup = (): void => {
+      try {
+        this.jwtTracking?.deleteExpired();
+        this.stuff.logger.info('[verdaccio-github-oauth-verifier] JWT tracking: expired entries cleaned up');
+      } catch (err) {
+        this.stuff.logger.error(`[verdaccio-github-oauth-verifier] JWT tracking cleanup failed: ${err}`);
+      }
+    };
+
+    let expression = this.jwtCleanupSchedule;
+    if (!cron.validate(expression)) {
+      this.stuff.logger.warn(
+        `[verdaccio-github-oauth-verifier] Invalid jwtCleanupSchedule "${expression}", using default "0 0 * * *"`
+      );
+      expression = '0 0 * * *';
+    }
+    this.cleanupTask = cron.schedule(expression, runCleanup);
   }
 
   // eslint-disable-next-line camelcase
@@ -130,8 +164,6 @@ class GithubOAuthVerifierMiddleware {
         const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
 
         if (this.jwtTracking) {
-          this.jwtTracking.deleteExpired();
-
           const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
           const latest = this.jwtTracking.getLatest(username);
 
