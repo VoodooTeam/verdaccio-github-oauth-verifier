@@ -1,4 +1,5 @@
 # verdaccio-github-oauth-verifier
+[![npm version](https://img.shields.io/npm/v/verdaccio-github-oauth-verifier.svg)](https://www.npmjs.com/package/verdaccio-github-oauth-verifier)
 
 A [Verdaccio](https://verdaccio.org/) auth plugin that verifies JWT tokens issued by [verdaccio-github-oauth-ui](https://github.com/n4bb12/verdaccio-github-oauth-ui) (or compatible OAuth UI) against GitHub organization membership, with optional JWT tracking and blacklisting for security.
 
@@ -19,6 +20,12 @@ A [Verdaccio](https://verdaccio.org/) auth plugin that verifies JWT tokens issue
 
 ```bash
 npm install verdaccio-github-oauth-verifier
+```
+
+or 
+
+```bash
+yarn install verdaccio-github-oauth-verifier
 ```
 
 ## Configuration
