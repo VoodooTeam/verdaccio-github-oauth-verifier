@@ -40,8 +40,8 @@ middlewares:
     org: your-github-org-name
     # Optional: cache TTL in minutes (default: 8 hours = 480)
     cacheTTLMinutes: 480
-    # Optional: JWT tracking (single token per user)
-    jwtTrackingDbPath: ./jwt-tracking.db
+    # Optional: JWT tracking (single token per user); DB at ~/.verdaccio/jwt-tracking.db
+    jwtTrackingEnabled: true
     # Optional: cron for cleaning expired JWT tracking rows (default: daily at midnight)
     jwtCleanupSchedule: "0 0 * * *"
 ```
@@ -55,7 +55,7 @@ middlewares:
 | `org`                        | string  | Yes*     | GitHub organization name. Users must be members of this org.                                                                                                            |
 | `auth.github-oauth-ui.token` | string  | Yes*     | GitHub token (Personal Access Token or GitHub App token) with `read:org` to check org membership.                                                                       |
 | `cacheTTLMinutes`            | number  | No       | How long to cache verification results (minutes). Default: `480` (8 hours).                                                                                             |
-| `jwtTrackingDbPath`          | string  | No       | Path to SQLite DB for JWT tracking. When set, only the most recent JWT per user is valid. Example: `./jwt-tracking.db`.                                                 |
+| `jwtTrackingEnabled`         | boolean | No       | When `true`, enable JWT tracking (only the most recent JWT per user). DB is stored at `~/.verdaccio/jwt-tracking.db`.                                                   |
 | `jwtCleanupSchedule`         | string  | No       | Cron expression for cleanup of expired JWT tracking rows. Default: `0 0 * * `* (daily at midnight). Format: 5 fields `minute hour day month weekday` or 6 with seconds. |
 
 
@@ -67,9 +67,9 @@ Create a Personal Access Token (or use a GitHub App token) with **read:org** and
 
 ## JWT tracking (single token per user)
 
-When `jwtTrackingDbPath` is set:
+When `jwtTrackingEnabled` is `true`:
 
-- The plugin stores the latest JWT per user (by hash and `iat`) in a SQLite database.
+- The plugin stores the latest JWT per user (by hash and `iat`) in a SQLite database at `~/.verdaccio/jwt-tracking.db`.
 - Only that latest token is accepted; any older token for the same user returns `401` with “JWT token has been superseded by a newer login”.
 - Expired tokens are rejected and the user’s row is removed when the token is seen as expired.
 - You can revoke a user’s token via the admin endpoint (see below); the plugin marks them as revoked and rejects that token.

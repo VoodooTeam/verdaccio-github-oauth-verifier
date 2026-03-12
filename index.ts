@@ -1,7 +1,10 @@
 import crypto from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
+import fs from 'fs';
 import { LRUCache } from 'lru-cache';
 import cron, { type ScheduledTask } from 'node-cron';
+import os from 'os';
+import path from 'path';
 import { JwtTrackingDb } from './jwt-tracking';
 
 /** Reusable tag for plugin log messages (e.g. for filtering in log aggregation). */
@@ -19,8 +22,8 @@ interface PluginConfig {
   token?: string;
   org?: string;
   cacheTTLMinutes?: number;
-  /** Path to SQLite DB for JWT tracking (e.g. ./jwt-tracking.db). When set, only the most recent JWT per user is allowed. */
-  jwtTrackingDbPath?: string;
+  /** When true, enable JWT tracking (only the most recent JWT per user). DB is stored at ~/.verdaccio/jwt-tracking.db. */
+  jwtTrackingEnabled?: boolean;
   /**
    * Cron expression for JWT tracking cleanup. Default: '0 0 * * *' (daily at midnight).
    * Format: minute hour day-of-month month day-of-week (5 fields), or second + those 5 (6 fields).
@@ -55,8 +58,19 @@ class GithubOAuthVerifierMiddleware {
     this.enabled = config != null && config.enabled !== false;
     this.cache = new LRUCache({ max: 1000, ttl: config?.cacheTTLMinutes ? config.cacheTTLMinutes * 60 * 1000 : 1000 * 60 * 60 * 8 });
 
-    const dbPath = config?.jwtTrackingDbPath;
-    this.jwtTracking = dbPath ? new JwtTrackingDb(dbPath) : null;
+    if (config?.jwtTrackingEnabled === true) {
+      try {
+        const verdaccioDir = path.join(os.homedir(), '.verdaccio');
+        fs.mkdirSync(verdaccioDir, { recursive: true });
+        const dbPath = path.join(verdaccioDir, 'jwt-tracking.db');
+        this.jwtTracking = new JwtTrackingDb(dbPath);
+      } catch (err) {
+        this.stuff.logger.warn(`${LOG_TAG} JWT tracking disabled: could not init DB at ~/.verdaccio/jwt-tracking.db: ${err}`);
+        this.jwtTracking = null;
+      }
+    } else {
+      this.jwtTracking = null;
+    }
     const raw = config?.jwtCleanupSchedule?.trim();
     this.jwtCleanupSchedule = raw && raw.length > 0 ? raw : '0 0 * * *';
     if (this.jwtTracking) {
