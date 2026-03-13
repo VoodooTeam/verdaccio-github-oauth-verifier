@@ -1,6 +1,6 @@
 {
   "name": "verdaccio-github-oauth-verifier",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Plugin that ensures we can verify the generated JWT oauth tokens and add optional black listing for security reasonss",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
