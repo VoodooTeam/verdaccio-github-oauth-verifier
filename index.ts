@@ -5,6 +5,7 @@ import { LRUCache } from 'lru-cache';
 import cron, { type ScheduledTask } from 'node-cron';
 import os from 'os';
 import path from 'path';
+import githubAppJwt from 'universal-github-app-jwt';
 import { JwtTrackingDb } from './jwt-tracking';
 
 /** Reusable tag for plugin log messages (e.g. for filtering in log aggregation). */
@@ -12,17 +13,35 @@ const LOG_TAG = '[verdaccio-github-oauth-verifier]';
 /** Prefix for debug logs (filter e.g. with grep). */
 const DEBUG_TAG = `${LOG_TAG} [debug]`;
 
-interface AuthConfig {
-  "github-oauth-ui"?: {
-    token?: string;
-  };
+/** If value looks like PEM content (contains -----BEGIN), return as-is; else read from file path. */
+function loadPem(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.includes('-----BEGIN')) {
+    return trimmed;
+  }
+  return fs.readFileSync(trimmed, 'utf8');
+}
+
+/** GitHub App credentials for installation-based API auth (optional alternative to token). */
+interface GithubAppConfig {
+  /** GitHub App ID (numeric, from app settings). */
+  clientId: string;
+  /** Reserved for future use; not required for JWT/installation token flow. */
+  clientSecret?: string;
+  /** Private key PEM content, or path to a .pem file. */
+  pem: string;
+  /** Installation ID for the org. If omitted, resolved via GET /orgs/{org}/installation. */
+  installationId?: number;
 }
 
 interface PluginConfig {
-  auth?: AuthConfig;
   enabled?: boolean;
   token?: string;
   org?: string;
+  /** Optional: use GitHub App (clientId + pem) instead of token for org membership checks. */
+  githubApp?: GithubAppConfig;
+  /** Optional: token for admin endpoints. */
+  adminToken?: string;
   cacheTTLMinutes?: number;
   /** When true, enable JWT tracking (only the most recent JWT per user). DB is stored at ~/.verdaccio/jwt-tracking.db. */
   jwtTrackingEnabled?: boolean;
@@ -42,11 +61,29 @@ interface PluginStuff {
   };
 }
 
+/** Normalized GitHub App config with PEM content loaded (not a path). */
+interface GithubAppConfigLoaded {
+  clientId: string;
+  pem: string;
+  installationId?: number;
+}
+
 class GithubOAuthVerifierMiddleware {
   private readonly stuff: PluginStuff;
   private readonly enabled: boolean;
+  /** OAuth/token for API when not using GitHub App; also used for admin when adminToken not set. */
   private readonly token: string;
   private readonly org: string;
+  /** When true, use GitHub App installation token for verifyUserInGitHubApp. */
+  private readonly useGitHubApp: boolean;
+  /** Set when useGitHubApp; PEM content already loaded. */
+  private readonly githubApp: GithubAppConfigLoaded | null;
+  /** Token for admin endpoints; falls back to token when not set. */
+  private readonly adminToken: string;
+  /** Resolved installation ID when not in config (cached after first resolution). */
+  private installationIdCache: number | null = null;
+  /** Cached installation access token and expiry (reused until ~5 min before expiry). */
+  private installationTokenCache: { token: string; expiresAt: number } | null = null;
   private readonly cache: LRUCache<string, boolean>;
   private readonly jwtTracking: JwtTrackingDb | null;
   /** Cron expression for cleanup. Default '0 0 * * *'. */
@@ -84,14 +121,64 @@ class GithubOAuthVerifierMiddleware {
       this.stuff.logger.info(`${LOG_TAG} Disabled`);
       this.token = '';
       this.org = '';
+      this.useGitHubApp = false;
+      this.githubApp = null;
+      this.adminToken = '';
       return;
     }
-    
-    this.token = config?.auth?.['github-oauth-ui']?.token ?? '';
+
     this.org = config?.org ?? '';
-    if (!this.token || !this.org) {
-      this.stuff.logger.error(`${LOG_TAG} Token or org is missing, disabling plugin`);
+    if (!this.org) {
+      this.stuff.logger.error(`${LOG_TAG} org is missing, disabling plugin`);
+      this.token = '';
+      this.useGitHubApp = false;
+      this.githubApp = null;
+      this.adminToken = '';
       return;
+    }
+
+    const oauthToken = config?.token ?? '';
+    const githubAppConfig = config?.githubApp;
+    const hasToken = Boolean(oauthToken?.trim());
+    const hasGitHubApp =
+      Boolean(githubAppConfig?.clientId?.trim() && githubAppConfig?.pem?.trim());
+
+    if (!hasToken && !hasGitHubApp) {
+      this.stuff.logger.error(
+        `${LOG_TAG} Neither token (auth.github-oauth-ui.token) nor GitHub App (githubApp.clientId + githubApp.pem) is configured, disabling plugin`
+      );
+      this.token = '';
+      this.useGitHubApp = false;
+      this.githubApp = null;
+      this.adminToken = '';
+      return;
+    }
+
+    this.adminToken = config?.adminToken?.trim() ?? '';
+    if (hasGitHubApp && githubAppConfig) {
+      try {
+        const pem = loadPem(githubAppConfig.pem);
+        this.githubApp = {
+          clientId: githubAppConfig.clientId.trim(),
+          pem,
+          installationId: githubAppConfig.installationId
+        };
+        this.useGitHubApp = true;
+        this.token = oauthToken?.trim() ?? '';
+        this.stuff.logger.info(`${LOG_TAG} Using GitHub App for org membership checks`);
+      } catch (err) {
+        this.stuff.logger.error(`${LOG_TAG} Failed to load GitHub App PEM: ${err}`);
+        this.token = '';
+        this.useGitHubApp = false;
+        this.githubApp = null;
+        this.adminToken = '';
+        return;
+      }
+    } else {
+      this.token = oauthToken?.trim() ?? '';
+      this.useGitHubApp = false;
+      this.githubApp = null;
+      this.stuff.logger.info(`${LOG_TAG} Using token for org membership checks`);
     }
   }
 
@@ -116,6 +203,97 @@ class GithubOAuthVerifierMiddleware {
     this.cleanupTask = cron.schedule(expression, runCleanup);
   }
 
+  /** Create a JWT for the GitHub App (used to get installation token). */
+  private async createAppJwt(): Promise<string> {
+    if (!this.githubApp) throw new Error('GitHub App not configured');
+    const { token } = await githubAppJwt({
+      id: this.githubApp.clientId,
+      privateKey: this.githubApp.pem
+    });
+    return token;
+  }
+
+  /** Resolve installation ID from config or via GET /orgs/{org}/installation (with user fallback on 404). */
+  private async getInstallationId(): Promise<number> {
+    if (this.githubApp?.installationId != null) {
+      return this.githubApp.installationId;
+    }
+    if (this.installationIdCache != null) {
+      return this.installationIdCache;
+    }
+    const jwt = await this.createAppJwt();
+    const headers = {
+      Authorization: `Bearer ${jwt}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+
+    // Try org installation first (required for org membership checks)
+    let response = await fetch(`https://api.github.com/orgs/${encodeURIComponent(this.org)}/installation`, {
+      method: 'GET',
+      headers
+    });
+
+    // If 404, try user installation (app may be installed on a user account with same slug)
+    if (response.status === 404) {
+      const userResponse = await fetch(`https://api.github.com/users/${encodeURIComponent(this.org)}/installation`, {
+        method: 'GET',
+        headers
+      });
+      if (userResponse.ok) {
+        response = userResponse;
+      }
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      if (response.status === 404) {
+        throw new Error(
+          `GitHub App is not installed on organization (or user) "${this.org}". ` +
+            `Install the app on the org at https://github.com/organizations/${encodeURIComponent(this.org)}/settings/installations, ` +
+            `or set githubApp.installationId in config to the installation ID from your app's installation URL. Original: ${response.status} ${text}`
+        );
+      }
+      throw new Error(`GitHub org installation lookup failed: ${response.status} ${text}`);
+    }
+    const data = (await response.json()) as { id: number };
+    this.installationIdCache = data.id;
+    return data.id;
+  }
+
+  /** Cached installation access token (reused until ~5 min before expiry). */
+  private async getInstallationAccessToken(): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    const margin = 5 * 60; // 5 minutes
+    if (
+      this.installationTokenCache != null &&
+      this.installationTokenCache.expiresAt > now + margin
+    ) {
+      return this.installationTokenCache.token;
+    }
+    const jwt = await this.createAppJwt();
+    const installationId = await this.getInstallationId();
+    const response = await fetch(
+      `https://api.github.com/app/installations/${installationId}/access_tokens`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      }
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`GitHub installation token request failed: ${response.status} ${text}`);
+    }
+    const data = (await response.json()) as { token: string; expires_at: string };
+    const expiresAt = new Date(data.expires_at).getTime() / 1000;
+    this.installationTokenCache = { token: data.token, expiresAt };
+    return data.token;
+  }
+
   // eslint-disable-next-line camelcase
   register_middlewares(
     app: {
@@ -129,8 +307,10 @@ class GithubOAuthVerifierMiddleware {
       return;
     }
 
-    if (!this.token || !this.org) {
-      this.stuff.logger.error(`${LOG_TAG} Token or org is missing, skipping middleware setup`);
+    if (!this.org || (!this.token && !this.useGitHubApp)) {
+      this.stuff.logger.error(
+        `${LOG_TAG} org or auth (token or GitHub App) is missing, skipping middleware setup`
+      );
       return;
     }
 
@@ -259,15 +439,25 @@ class GithubOAuthVerifierMiddleware {
   }
 
   private async verifyUserInGitHubApp(username: string): Promise<boolean> {
-    const orgName = this.org; // e.g., 'my-company-org'
-    const token = this.token; // Your configured admin token
-    
+    const orgName = this.org;
+    let token: string;
+    if (this.useGitHubApp) {
+      try {
+        token = await this.getInstallationAccessToken();
+      } catch (err) {
+        this.stuff.logger.error(`${LOG_TAG} Failed to get GitHub App installation token: ${err}`);
+        return false;
+      }
+    } else {
+      token = this.token;
+    }
+
     try {
       const response = await fetch(`https://api.github.com/orgs/${orgName}/members/${username}`, {
         method: 'GET',
         headers: {
-          'Authorization': `Bearer ${token}`,
-          'Accept': 'application/vnd.github.v3+json',
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github.v3+json',
           'X-GitHub-Api-Version': '2022-11-28'
         }
       });
@@ -301,7 +491,8 @@ class GithubOAuthVerifierMiddleware {
       return;
     }
     const token = auth.slice(7);
-    if (token !== this.token) {
+    const adminToken = this.adminToken;
+    if (!adminToken || token !== adminToken) {
       res.status(403).json({ error: 'Invalid admin token' });
       return;
     }

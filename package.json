@@ -28,7 +28,8 @@
   "dependencies": {
     "better-sqlite3": "^11.6.0",
     "lru-cache": "^11.2.6",
-    "node-cron": "^4.2.1"
+    "node-cron": "^4.2.1",
+    "universal-github-app-jwt": "^2.2.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
