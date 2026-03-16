@@ -10,8 +10,6 @@ import { JwtTrackingDb } from './jwt-tracking';
 
 /** Reusable tag for plugin log messages (e.g. for filtering in log aggregation). */
 const LOG_TAG = '[verdaccio-github-oauth-verifier]';
-/** Prefix for debug logs (filter e.g. with grep). */
-const DEBUG_TAG = `${LOG_TAG} [debug]`;
 
 /** If value looks like PEM content (contains -----BEGIN), return as-is; else read from file path. */
 function loadPem(value: string): string {
@@ -26,8 +24,6 @@ function loadPem(value: string): string {
 interface GithubAppConfig {
   /** GitHub App ID (numeric, from app settings). */
   clientId: string;
-  /** Reserved for future use; not required for JWT/installation token flow. */
-  clientSecret?: string;
   /** Private key PEM content, or path to a .pem file. */
   pem: string;
   /** Installation ID for the org. If omitted, resolved via GET /orgs/{org}/installation. */
@@ -58,6 +54,8 @@ interface PluginStuff {
     info: (msg: string) => void;
     warn: (msg: string) => void;
     error: (msg: string) => void;
+    /** Bunyan-style debug; only emitted when Verdaccio log level is debug or lower. */
+    debug?: (msg: string) => void;
   };
 }
 
@@ -179,6 +177,13 @@ class GithubOAuthVerifierMiddleware {
       this.useGitHubApp = false;
       this.githubApp = null;
       this.stuff.logger.info(`${LOG_TAG} Using token for org membership checks`);
+    }
+  }
+
+  /** Log at debug level; no-op if logger has no debug (e.g. in tests). Only emitted when Verdaccio log level is debug. */
+  private logDebug(msg: string): void {
+    if (typeof this.stuff.logger.debug === 'function') {
+      this.stuff.logger.debug(`${LOG_TAG} ${msg}`);
     }
   }
 
@@ -369,37 +374,37 @@ class GithubOAuthVerifierMiddleware {
         const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;
         const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
 
-        this.stuff.logger.info(`${DEBUG_TAG} JWT payload: ${JSON.stringify(decodedPayload)}`);
-        this.stuff.logger.info(`${DEBUG_TAG} Verifying user="${username}" iat=${iat} exp=${exp}`);
+        this.logDebug(`JWT payload: ${JSON.stringify(decodedPayload)}`);
+        this.logDebug(`Verifying user="${username}" iat=${iat} exp=${exp}`);
 
         if (this.jwtTracking) {
           const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
           const latest = this.jwtTracking.getLatest(username);
 
-          this.stuff.logger.info(
-            `${DEBUG_TAG} JWT tracking: latest=${latest === null ? 'null' : `{ revoked=${!!latest.revoked}, iat=${latest.iat} }`}`
+          this.logDebug(
+            `JWT tracking: latest=${latest === null ? 'null' : `{ revoked=${!!latest.revoked}, iat=${latest.iat} }`}`
           );
 
           if (latest !== null && latest.revoked) {
             const isSameToken = latest.token_hash === tokenHash && latest.iat === iat;
-            this.stuff.logger.info(
-              `${DEBUG_TAG} User "${username}" has revoked token in DB; isSameToken=${isSameToken} (token_hash match, iat match)`
+            this.logDebug(
+              `User "${username}" has revoked token in DB; isSameToken=${isSameToken} (token_hash match, iat match)`
             );
             if (isSameToken) {
-              this.stuff.logger.info(`${DEBUG_TAG} Denying: GitHub authorization revoked (same token was revoked)`);
+              this.logDebug('Denying: GitHub authorization revoked (same token was revoked)');
               return res.status(401).json({ error: 'GitHub authorization revoked' });
             }
           }
 
           if (exp !== null && exp < Math.floor(Date.now() / 1000)) {
-            this.stuff.logger.info(`${DEBUG_TAG} Denying: JWT token has expired for user "${username}"`);
+            this.logDebug(`Denying: JWT token has expired for user "${username}"`);
             this.jwtTracking.deleteUser(username);
             return res.status(401).json({ error: 'JWT token has expired' });
           }
 
           if (latest !== null && !latest.revoked && iat < latest.iat) {
-            this.stuff.logger.info(
-              `${DEBUG_TAG} Denying: token superseded (iat=${iat} < latest.iat=${latest.iat}) for user "${username}"`
+            this.logDebug(
+              `Denying: token superseded (iat=${iat} < latest.iat=${latest.iat}) for user "${username}"`
             );
             return res.status(401).json({ error: 'JWT token has been superseded by a newer login' });
           }
@@ -410,26 +415,26 @@ class GithubOAuthVerifierMiddleware {
 
         if (this.cache.has(username)) {
           const cached = this.cache.get(username);
-          this.stuff.logger.info(`${DEBUG_TAG} Cache hit for "${username}": allowed=${cached}`);
+          this.logDebug(`Cache hit for "${username}": allowed=${cached}`);
           if (cached === false) {
-            this.stuff.logger.info(`${DEBUG_TAG} Denying: cached denial (GitHub authorization revoked) for user "${username}"`);
+            this.logDebug(`Denying: cached denial (GitHub authorization revoked) for user "${username}"`);
             return res.status(401).json({ error: 'GitHub authorization revoked' });
           }
           return next();
         }
 
-        this.stuff.logger.info(`${DEBUG_TAG} Cache miss for "${username}"; checking GitHub org membership`);
+        this.logDebug(`Cache miss for "${username}"; checking GitHub org membership`);
         const isUserInGitHubApp = await this.verifyUserInGitHubApp(username);
-        this.stuff.logger.info(`${DEBUG_TAG} GitHub org check for "${username}": isMember=${isUserInGitHubApp}`);
+        this.logDebug(`GitHub org check for "${username}": isMember=${isUserInGitHubApp}`);
         if (!isUserInGitHubApp) {
           this.cache.set(username, false);
           this.jwtTracking?.setRevoked(username);
-          this.stuff.logger.info(`${DEBUG_TAG} Denying: user "${username}" not in org "${this.org}" or API error (GitHub authorization revoked)`);
+          this.logDebug(`Denying: user "${username}" not in org "${this.org}" or API error (GitHub authorization revoked)`);
           return res.status(401).json({ error: 'GitHub authorization revoked' });
         }
 
         this.cache.set(username, true);
-        this.stuff.logger.info(`${DEBUG_TAG} Allowed user "${username}"`);
+        this.logDebug(`Allowed user "${username}"`);
       } catch (error) {
         this.stuff.logger.error(`${LOG_TAG} Error verifying token: ${error}`);
       }
