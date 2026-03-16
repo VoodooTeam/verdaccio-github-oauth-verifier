@@ -121,14 +121,17 @@ This helps enforce “one active session per user” and allows revoking access 
 
 Both endpoints require a **Bearer** token in the `Authorization` header. The accepted token is `adminToken` if set, otherwise `auth.github-oauth-ui.token`. When using GitHub App only (no OAuth token), set `adminToken` to protect these routes.
 
-### Invalidate JWT for a user
+### Invalidate JWT
 
 ```http
 POST /-/github-oauth-verifier/invalidate-jwt?username=<username>
 Authorization: Bearer <your-admin-token>
 ```
 
-Marks the user’s token as revoked (when JWT tracking is enabled) and removes them from the in-memory cache. Subsequent requests with that user’s JWT will receive `401` with “GitHub authorization revoked”.
+- With `username`: marks that user’s token as revoked (when JWT tracking is enabled) and removes them from the in-memory cache.
+- Without `username`: marks all users’ tokens as revoked and clears the entire cache.
+
+Subsequent requests with a revoked user’s JWT will receive `401` with “GitHub authorization revoked”.
 
 ### Clear cache
 

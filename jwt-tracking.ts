@@ -56,6 +56,10 @@ export class JwtTrackingDb {
     ).run(username);
   }
 
+  setRevokedAll(): void {
+    this.db.prepare('UPDATE jwt_tracking SET revoked = 1').run();
+  }
+
   deleteUser(username: string): void {
     this.db.prepare('DELETE FROM jwt_tracking WHERE username = ?').run(username);
   }

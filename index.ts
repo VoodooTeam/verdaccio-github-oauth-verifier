@@ -11,6 +11,22 @@ import { JwtTrackingDb } from './jwt-tracking';
 /** Reusable tag for plugin log messages (e.g. for filtering in log aggregation). */
 const LOG_TAG = '[verdaccio-github-oauth-verifier]';
 
+/** Max length for username (used in DB and cache); avoids abuse and aligns with common limits. */
+const MAX_USERNAME_LENGTH = 256;
+
+/** Control characters and null byte – must not appear in usernames passed to DB/cache. */
+const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+
+/**
+ * Returns true if the value is a safe username for use in DB/cache (defense in depth against injection).
+ * Call this for any user-supplied username before passing to jwtTracking or cache.
+ */
+function isValidUsername(value: string | null): value is string {
+  if (value === null || typeof value !== 'string') return false;
+  const s = value.trim();
+  return s.length > 0 && s.length <= MAX_USERNAME_LENGTH && !CONTROL_CHARS.test(s);
+}
+
 /** If value looks like PEM content (contains -----BEGIN), return as-is; else read from file path. */
 function loadPem(value: string): string {
   const trimmed = value.trim();
@@ -328,26 +344,37 @@ class GithubOAuthVerifierMiddleware {
         '/-/github-oauth-verifier/invalidate-jwt',
         (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
         (req: Request, res: Response) => {
-          const username = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
-          if (!username) {
-            res.status(400).json({ error: 'Missing query parameter: username' });
-            return;
+          const raw = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
+          if (raw !== null && raw !== '') {
+            if (!isValidUsername(raw)) {
+              res.status(400).json({ error: 'Invalid username' });
+              return;
+            }
+            this.jwtTracking?.setRevoked(raw);
+            this.cache.delete(raw);
+            this.stuff.logger.info(`${LOG_TAG} JWT invalidated for user: ${raw}`);
+            res.status(200).json({ ok: true, message: `JWT invalidated for user: ${raw}` });
+          } else {
+            this.jwtTracking?.setRevokedAll();
+            this.cache.clear();
+            this.stuff.logger.info(`${LOG_TAG} JWT invalidated for all users`);
+            res.status(200).json({ ok: true, message: 'JWT invalidated for all users' });
           }
-          this.jwtTracking?.setRevoked(username);
-          this.cache.delete(username);
-          this.stuff.logger.info(`${LOG_TAG} JWT invalidated for user: ${username}`);
-          res.status(200).json({ ok: true, message: `JWT invalidated for user: ${username}` });
         }
       );
       app.post(
         '/-/github-oauth-verifier/clear-cache',
         (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
         (req: Request, res: Response) => {
-          const username = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
-          if (username) {
-            this.cache.delete(username);
-            this.stuff.logger.info(`${LOG_TAG} Cache cleared for user: ${username}`);
-            res.status(200).json({ ok: true, message: `Cache cleared for user: ${username}` });
+          const raw = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
+          if (raw !== null && raw !== '') {
+            if (!isValidUsername(raw)) {
+              res.status(400).json({ error: 'Invalid username' });
+              return;
+            }
+            this.cache.delete(raw);
+            this.stuff.logger.info(`${LOG_TAG} Cache cleared for user: ${raw}`);
+            res.status(200).json({ ok: true, message: `Cache cleared for user: ${raw}` });
           } else {
             this.cache.clear();
             this.stuff.logger.info(`${LOG_TAG} Entire cache cleared`);
@@ -370,9 +397,15 @@ class GithubOAuthVerifierMiddleware {
 
         const payloadBase64 = tokenParts[1];
         const decodedPayload = JSON.parse(Buffer.from(payloadBase64, 'base64').toString('utf8'));
-        const username = decodedPayload.name;
+        const usernameRaw = typeof decodedPayload.name === 'string' ? decodedPayload.name.trim() : '';
         const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;
         const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
+
+        if (!isValidUsername(usernameRaw)) {
+          this.logDebug(`Rejecting token: invalid or missing username in payload`);
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+        const username = usernameRaw;
 
         this.logDebug(`JWT payload: ${JSON.stringify(decodedPayload)}`);
         this.logDebug(`Verifying user="${username}" iat=${iat} exp=${exp}`);
