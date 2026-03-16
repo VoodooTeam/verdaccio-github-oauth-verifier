@@ -43,7 +43,6 @@ middlewares:
     # Option B: use a GitHub App (clientId + pem); if both are set, GitHub App is used for org checks
     # githubApp:
     #   clientId: "123456"
-    #   clientSecret: "optional"
     #   pem: "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
     #   installationId: 12345  # optional; resolved from org if omitted
     # adminToken: "optional-token-for-admin-endpoints-when-using-github-app-only"
@@ -59,10 +58,9 @@ middlewares:
 | ---------------------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`                    | boolean | No       | Enable the plugin. Default: `true` if the plugin block is present.                                                                                                      |
 | `org`                        | string  | Yes      | GitHub organization name. Users must be members of this org.                                                                                                            |
-| `token` | string  | Yes*     | GitHub token (PAT or GitHub App token) with `read:org`. Required unless `githubApp` is configured.                                                                      |
+| `token`                      | string  | Yes*     | GitHub token (PAT or GitHub App token) with `read:org`. Required unless `githubApp` is configured.                                                                      |
 | `githubApp`                  | object  | Yes*     | GitHub App credentials. Required unless `auth.github-oauth-ui.token` is set. If both are set, GitHub App is used for org membership checks.                             |
 | `githubApp.clientId`         | string  | Yes**    | GitHub App ID (numeric, from app settings). Required when using `githubApp`.                                                                                            |
-| `githubApp.clientSecret`     | string  | No       | Reserved for future use; not required for JWT/installation token flow.                                                                                                  |
 | `githubApp.pem`              | string  | Yes**    | Private key: PEM content (multi-line string) or path to a `.pem` file. Required when using `githubApp`.                                                                 |
 | `githubApp.installationId`   | number  | No       | Installation ID for the org. If omitted, the plugin resolves it via `GET /orgs/{org}/installation`.                                                                     |
 | `adminToken`                 | string  | No       | Token for admin endpoints. When using GitHub App only (no `auth.github-oauth-ui.token`), set this to protect admin routes. Otherwise admin uses the same token.         |
