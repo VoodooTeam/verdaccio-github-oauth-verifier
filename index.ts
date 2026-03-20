@@ -52,7 +52,7 @@ interface PluginConfig {
   org?: string;
   /** Optional: use GitHub App (clientId + pem) instead of token for org membership checks. */
   githubApp?: GithubAppConfig;
-  /** Optional: token for admin endpoints. */
+  /** Optional: Bearer token required for admin endpoints; if omitted, those routes are not registered. */
   adminToken?: string;
   cacheTTLMinutes?: number;
   /** When true, enable JWT tracking (only the most recent JWT per user). DB is stored at ~/.verdaccio/jwt-tracking.db. */
@@ -85,14 +85,14 @@ interface GithubAppConfigLoaded {
 class GithubOAuthVerifierMiddleware {
   private readonly stuff: PluginStuff;
   private readonly enabled: boolean;
-  /** OAuth/token for API when not using GitHub App; also used for admin when adminToken not set. */
+  /** OAuth/token for API when not using GitHub App. */
   private readonly token: string;
   private readonly org: string;
   /** When true, use GitHub App installation token for verifyUserInGitHubApp. */
   private readonly useGitHubApp: boolean;
   /** Set when useGitHubApp; PEM content already loaded. */
   private readonly githubApp: GithubAppConfigLoaded | null;
-  /** Token for admin endpoints; falls back to token when not set. */
+  /** Token for admin endpoints; if unset, admin routes are not registered. */
   private readonly adminToken: string;
   /** Resolved installation ID when not in config (cached after first resolution). */
   private installationIdCache: number | null = null;
@@ -340,48 +340,54 @@ class GithubOAuthVerifierMiddleware {
     );
 
     if (app.post) {
-      app.post(
-        '/-/github-oauth-verifier/invalidate-jwt',
-        (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
-        (req: Request, res: Response) => {
-          const raw = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
-          if (raw !== null && raw !== '') {
-            if (!isValidUsername(raw)) {
-              res.status(400).json({ error: 'Invalid username' });
-              return;
+      if (this.adminToken) {
+        app.post(
+          '/-/github-oauth-verifier/invalidate-jwt',
+          (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
+          (req: Request, res: Response) => {
+            const raw = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
+            if (raw !== null && raw !== '') {
+              if (!isValidUsername(raw)) {
+                res.status(400).json({ error: 'Invalid username' });
+                return;
+              }
+              this.jwtTracking?.setRevoked(raw);
+              this.cache.delete(raw);
+              this.stuff.logger.info(`${LOG_TAG} JWT invalidated for user: ${raw}`);
+              res.status(200).json({ ok: true, message: `JWT invalidated for user: ${raw}` });
+            } else {
+              this.jwtTracking?.setRevokedAll();
+              this.cache.clear();
+              this.stuff.logger.info(`${LOG_TAG} JWT invalidated for all users`);
+              res.status(200).json({ ok: true, message: 'JWT invalidated for all users' });
             }
-            this.jwtTracking?.setRevoked(raw);
-            this.cache.delete(raw);
-            this.stuff.logger.info(`${LOG_TAG} JWT invalidated for user: ${raw}`);
-            res.status(200).json({ ok: true, message: `JWT invalidated for user: ${raw}` });
-          } else {
-            this.jwtTracking?.setRevokedAll();
-            this.cache.clear();
-            this.stuff.logger.info(`${LOG_TAG} JWT invalidated for all users`);
-            res.status(200).json({ ok: true, message: 'JWT invalidated for all users' });
           }
-        }
-      );
-      app.post(
-        '/-/github-oauth-verifier/clear-cache',
-        (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
-        (req: Request, res: Response) => {
-          const raw = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
-          if (raw !== null && raw !== '') {
-            if (!isValidUsername(raw)) {
-              res.status(400).json({ error: 'Invalid username' });
-              return;
+        );
+        app.post(
+          '/-/github-oauth-verifier/clear-cache',
+          (req: Request, res: Response, next: NextFunction) => this.requireAdminToken(req, res, next),
+          (req: Request, res: Response) => {
+            const raw = typeof req.query?.username === 'string' ? req.query.username.trim() : null;
+            if (raw !== null && raw !== '') {
+              if (!isValidUsername(raw)) {
+                res.status(400).json({ error: 'Invalid username' });
+                return;
+              }
+              this.cache.delete(raw);
+              this.stuff.logger.info(`${LOG_TAG} Cache cleared for user: ${raw}`);
+              res.status(200).json({ ok: true, message: `Cache cleared for user: ${raw}` });
+            } else {
+              this.cache.clear();
+              this.stuff.logger.info(`${LOG_TAG} Entire cache cleared`);
+              res.status(200).json({ ok: true, message: 'Entire cache cleared' });
             }
-            this.cache.delete(raw);
-            this.stuff.logger.info(`${LOG_TAG} Cache cleared for user: ${raw}`);
-            res.status(200).json({ ok: true, message: `Cache cleared for user: ${raw}` });
-          } else {
-            this.cache.clear();
-            this.stuff.logger.info(`${LOG_TAG} Entire cache cleared`);
-            res.status(200).json({ ok: true, message: 'Entire cache cleared' });
           }
-        }
-      );
+        );
+      } else {
+        this.stuff.logger.warn(
+          `${LOG_TAG} adminToken is not set; admin endpoints invalidate-jwt and clear-cache are not registered`
+        );
+      }
     }
 
     app.use(async (req: Request, res: Response, next: NextFunction) => {
@@ -443,6 +449,16 @@ class GithubOAuthVerifierMiddleware {
           }
 
           const expForDb = exp !== null ? exp : 2147483647; // no expiry → far future for cleanup
+          const isNewJwt =
+            latest === null ||
+            latest.token_hash !== tokenHash ||
+            latest.iat !== iat;
+          if (isNewJwt) {
+            this.cache.delete(username);
+            this.logDebug(
+              `Cleared org-verification cache for "${username}" (new or changed JWT, re-verify against GitHub)`
+            );
+          }
           this.jwtTracking.setLatest(username, tokenHash, iat, expForDb, 0);
         }
 
@@ -524,16 +540,22 @@ class GithubOAuthVerifierMiddleware {
 
   private requireAdminToken(req: Request, res: Response, next: NextFunction): void {
     const auth = req.headers?.authorization;
+    this.logDebug(
+      `requireAdminToken: Authorization=${auth === undefined ? '(missing)' : JSON.stringify(auth)}`
+    );
+    this.logDebug(`requireAdminToken: configured adminToken=${JSON.stringify(this.adminToken)}`);
     if (!auth || !auth.startsWith('Bearer ')) {
       res.status(401).json({ error: 'Missing or invalid Authorization header (Bearer token required)' });
       return;
     }
-    const token = auth.slice(7);
-    const adminToken = this.adminToken;
-    if (!adminToken || token !== adminToken) {
+    const token = auth.split(' ')[1];
+    this.logDebug(`requireAdminToken: presented Bearer token=${JSON.stringify(token)}`);
+    if (token !== this.adminToken) {
+      this.logDebug('requireAdminToken: token mismatch (presented !== configured adminToken)');
       res.status(403).json({ error: 'Invalid admin token' });
       return;
     }
+    this.logDebug('requireAdminToken: accepted');
     next();
   }
 }
