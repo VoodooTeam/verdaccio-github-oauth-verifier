@@ -11,6 +11,7 @@ A [Verdaccio](https://verdaccio.org/) auth plugin that verifies JWT tokens issue
 - **Optional JWT tracking**: When enabled, only the most recent JWT per user is accepted; older tokens are rejected (e.g. after re-login or token rotation).
 - **Revocation**: Admin endpoints to invalidate a user’s JWT or clear cache entries.
 - **Scheduled cleanup**: Cron-based cleanup of expired JWT tracking entries in the SQLite database.
+- **Allow list**: Optional GitHub logins that skip the org membership API (e.g. CI or bot accounts) while JWT rules still apply.
 
 ## Requirements
 
@@ -50,6 +51,10 @@ middlewares:
     cacheTTLMinutes: 480
     jwtTrackingEnabled: true
     jwtCleanupSchedule: "0 0 * * *"
+    # Optional: skip GitHub org membership check for these logins (case-insensitive). JWT expiry and JWT tracking still apply.
+    # allowList:
+    #   - my-ci-bot
+    #   - github-actions
 ```
 
 ### Configuration options
@@ -67,6 +72,7 @@ middlewares:
 | `cacheTTLMinutes`            | number  | No       | How long to cache verification results (minutes). Default: `480` (8 hours).                                                                                             |
 | `jwtTrackingEnabled`         | boolean | No       | When `true`, enable JWT tracking (only the most recent JWT per user). DB is stored at `~/.verdaccio/jwt-tracking.db`.                                                   |
 | `jwtCleanupSchedule`         | string  | No       | Cron expression for cleanup of expired JWT tracking rows. Default: `0 0 * * *` (daily at midnight). Format: 5 fields `minute hour day month weekday` or 6 with seconds. |
+| `allowList`                  | string[] | No       | GitHub usernames (logins) that bypass the org membership API and cache for that check. Matching is case-insensitive. Invalid entries are skipped with a warning. JWT shape, expiry, and JWT tracking (if enabled) still apply. |
 
 \* At least one of `auth.github-oauth-ui.token` or `githubApp` (with `clientId` and `pem`) is required when the plugin is enabled.  
 \** Required when `githubApp` is used.
@@ -104,6 +110,13 @@ If your app was created in **Developer settings** (not from the marketplace) and
   **Profile** → **Settings** → **Applications** → your app → **Configure**. The installation ID is the number at the end of that page’s URL.
 
 Setting `installationId` avoids the automatic org lookup and works even when the API lookup returns 404 (e.g. for some org-only or private setups).
+
+### Allow list (`allowList`)
+
+Use `allowList` when some accounts should reach the registry with a valid OAuth-issued JWT but are not (or should not be) checked as org members—common for **CI users**, **machine accounts**, or **bots** that authenticate via your OAuth flow but are not in the GitHub org (or where the membership API is not appropriate).
+
+- Listed users **skip** the in-memory org verification cache and the `GET /orgs/{org}/members/{username}` call.
+- They are **not** exempt from: parsing the JWT, username validation, token expiry, or JWT tracking (single active token, revocation) when those features apply.
 
 ## JWT tracking (single token per user)
 
@@ -151,6 +164,7 @@ Use this to force re-validation against GitHub on the next request (e.g. after o
 2. **Invalid or non-JWT `Authorization`**: Request passes through (plugin only validates JWTs it can parse).
 3. **Valid JWT**:
   - If JWT tracking is enabled: check single-token-per-user and revocation; reject if superseded or revoked.
+  - If the username is in `allowList` → allow request (org membership check skipped).
   - If the username is in the cache and allowed → allow request.
   - If the username is in the cache and disallowed → `401` “GitHub authorization revoked”.
   - Otherwise: call GitHub API `GET /orgs/{org}/members/{username}`. If `204` → allow and cache; if `404` (or other failure) → deny, cache denial, and optionally mark as revoked in JWT tracking.

@@ -63,6 +63,11 @@ interface PluginConfig {
    * Examples: '0 0 * * *' midnight daily, '0 0 * * * *' every minute at 0 sec, every N seconds use 6-field cron.
    */
   jwtCleanupSchedule?: string;
+  /**
+   * GitHub usernames (login) that skip the org membership API check. Matching is case-insensitive.
+   * JWT shape, expiry, and JWT tracking (if enabled) still apply. Use for CI or bot accounts that are not org members.
+   */
+  allowList?: string[];
 }
 
 interface PluginStuff {
@@ -103,6 +108,8 @@ class GithubOAuthVerifierMiddleware {
   /** Cron expression for cleanup. Default '0 0 * * *'. */
   private readonly jwtCleanupSchedule: string;
   private cleanupTask: ScheduledTask | null = null;
+  /** Lowercase GitHub logins that bypass org membership verification only. */
+  private readonly allowList: Set<string>;
 
   constructor(config: PluginConfig | undefined, stuff: PluginStuff) {
     this.stuff = stuff;
@@ -126,6 +133,21 @@ class GithubOAuthVerifierMiddleware {
     }
     const raw = config?.jwtCleanupSchedule?.trim();
     this.jwtCleanupSchedule = raw && raw.length > 0 ? raw : '0 0 * * *';
+    this.allowList = new Set<string>();
+    for (const entry of config?.allowList ?? []) {
+      if (typeof entry !== 'string') continue;
+      const trimmed = entry.trim();
+      if (!isValidUsername(trimmed)) {
+        this.stuff.logger.warn(`${LOG_TAG} allowList: skipping invalid username entry: ${JSON.stringify(entry)}`);
+        continue;
+      }
+      this.allowList.add(trimmed.toLowerCase());
+    }
+    if (this.allowList.size > 0) {
+      this.stuff.logger.info(
+        `${LOG_TAG} allowList enabled (${this.allowList.size} user(s)): org membership check skipped for those logins`
+      );
+    }
     if (this.jwtTracking) {
       this.stuff.logger.info(`${LOG_TAG} JWT tracking DB enabled (only most recent token per user)`);
       this.scheduleCleanup();
@@ -194,6 +216,11 @@ class GithubOAuthVerifierMiddleware {
       this.githubApp = null;
       this.stuff.logger.info(`${LOG_TAG} Using token for org membership checks`);
     }
+  }
+
+  /** True if this GitHub login bypasses org membership verification (case-insensitive). */
+  private isAllowListed(username: string): boolean {
+    return this.allowList.has(username.toLowerCase());
   }
 
   /** Log at debug level; no-op if logger has no debug (e.g. in tests). Only emitted when Verdaccio log level is debug. */
@@ -460,6 +487,13 @@ class GithubOAuthVerifierMiddleware {
             );
           }
           this.jwtTracking.setLatest(username, tokenHash, iat, expForDb, 0);
+        }
+
+        if (this.isAllowListed(username)) {
+          this.logDebug(
+            `Allow-listed user "${username}": skipping org membership cache/API (still subject to JWT rules above)`
+          );
+          return next();
         }
 
         if (this.cache.has(username)) {
