@@ -27,6 +27,26 @@ function isValidUsername(value: string | null): value is string {
   return s.length > 0 && s.length <= MAX_USERNAME_LENGTH && !CONTROL_CHARS.test(s);
 }
 
+/** Groups added by generated tokens (e.g. verdaccio-static-access-token) use this prefix. */
+const CI_GROUP_PREFIX = 'ci-';
+
+/**
+ * True if the decoded JWT payload includes at least one group string starting with {@link CI_GROUP_PREFIX}
+ * in `groups` or `real_groups` (convention for machine / static-token JWTs).
+ */
+function hasCiPrefixedGroup(payload: Record<string, unknown>): boolean {
+  for (const key of ['groups', 'real_groups'] as const) {
+    const arr = payload[key];
+    if (!Array.isArray(arr)) continue;
+    for (const g of arr) {
+      if (typeof g === 'string' && g.startsWith(CI_GROUP_PREFIX)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** If value looks like PEM content (contains -----BEGIN), return as-is; else read from file path. */
 function loadPem(value: string): string {
   const trimmed = value.trim();
@@ -64,9 +84,9 @@ interface PluginConfig {
    */
   jwtCleanupSchedule?: string;
   /**
-   * GitHub usernames (login) that skip this plugin’s JWT tracking and org membership checks. Matching is case-insensitive.
-   * The payload is only decoded to read `name`; Verdaccio is responsible for verifying the JWT (signature, expiry, etc.).
-   * Use for CI or bot accounts that are not org members or use generated tokens.
+   * GitHub usernames (login) that may skip this plugin’s JWT tracking and org checks. Matching is case-insensitive.
+   * Bypass only applies when the JWT also has at least one `groups` or `real_groups` entry starting with `ci-`
+   * (e.g. static access tokens). OAuth user JWTs without that marker are fully verified.
    */
   allowList?: string[];
 }
@@ -109,7 +129,7 @@ class GithubOAuthVerifierMiddleware {
   /** Cron expression for cleanup. Default '0 0 * * *'. */
   private readonly jwtCleanupSchedule: string;
   private cleanupTask: ScheduledTask | null = null;
-  /** Lowercase GitHub logins that bypass org membership verification only. */
+  /** Lowercase GitHub logins eligible for bypass when the JWT carries a `ci-` group (see hasCiPrefixedGroup). */
   private readonly allowList: Set<string>;
 
   constructor(config: PluginConfig | undefined, stuff: PluginStuff) {
@@ -146,7 +166,7 @@ class GithubOAuthVerifierMiddleware {
     }
     if (this.allowList.size > 0) {
       this.stuff.logger.info(
-        `${LOG_TAG} allowList enabled (${this.allowList.size} user(s)): JWT tracking and org checks skipped for those logins (Verdaccio still validates JWTs)`
+        `${LOG_TAG} allowList enabled (${this.allowList.size} user(s)): skip JWT tracking + org only when JWT has a group prefixed "${CI_GROUP_PREFIX}"`
       );
     }
     if (this.jwtTracking) {
@@ -438,12 +458,18 @@ class GithubOAuthVerifierMiddleware {
           return res.status(401).json({ error: 'Invalid token' });
         }
         const username = usernameRaw;
+        const payloadObj = decodedPayload as Record<string, unknown>;
 
-        if (this.isAllowListed(username)) {
+        if (this.isAllowListed(username) && hasCiPrefixedGroup(payloadObj)) {
           this.logDebug(
-            `Allow-listed user "${username}": skipping JWT tracking and org checks (Verdaccio validates the JWT)`
+            `Allow-listed user "${username}" with ${CI_GROUP_PREFIX}* group: skipping JWT tracking and org checks (Verdaccio validates the JWT)`
           );
           return next();
+        }
+        if (this.isAllowListed(username)) {
+          this.logDebug(
+            `Allow-listed user "${username}" but JWT has no ${CI_GROUP_PREFIX}* group; applying JWT tracking and org checks`
+          );
         }
 
         const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;

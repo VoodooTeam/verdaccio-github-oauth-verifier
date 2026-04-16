@@ -11,7 +11,7 @@ A [Verdaccio](https://verdaccio.org/) auth plugin that verifies JWT tokens issue
 - **Optional JWT tracking**: When enabled, only the most recent JWT per user is accepted; older tokens are rejected (e.g. after re-login or token rotation).
 - **Revocation**: Admin endpoints to invalidate a user’s JWT or clear cache entries.
 - **Scheduled cleanup**: Cron-based cleanup of expired JWT tracking entries in the SQLite database.
-- **Allow list**: Optional GitHub logins that skip this plugin’s JWT tracking and org checks after decoding `name`; Verdaccio still validates the JWT (e.g. CI or generated tokens).
+- **Allow list**: Optional GitHub logins that skip JWT tracking and org checks only when the JWT includes a `ci-*` group (e.g. machine tokens from **verdaccio-static-access-token**); normal OAuth JWTs for the same login are still fully checked.
 
 ## Requirements
 
@@ -51,7 +51,7 @@ middlewares:
     cacheTTLMinutes: 480
     jwtTrackingEnabled: true
     jwtCleanupSchedule: "0 0 * * *"
-    # Optional: these logins skip JWT tracking + org checks here; Verdaccio validates the JWT (case-insensitive).
+    # Optional: these logins skip JWT tracking + org only if JWT has a group starting with ci- (groups / real_groups).
     # allowList:
     #   - my-ci-bot
     #   - github-actions
@@ -72,7 +72,7 @@ middlewares:
 | `cacheTTLMinutes`            | number  | No       | How long to cache verification results (minutes). Default: `480` (8 hours).                                                                                             |
 | `jwtTrackingEnabled`         | boolean | No       | When `true`, enable JWT tracking (only the most recent JWT per user). DB is stored at `~/.verdaccio/jwt-tracking.db`.                                                   |
 | `jwtCleanupSchedule`         | string  | No       | Cron expression for cleanup of expired JWT tracking rows. Default: `0 0 * * *` (daily at midnight). Format: 5 fields `minute hour day month weekday` or 6 with seconds. |
-| `allowList`                  | string[] | No       | GitHub usernames (logins) that bypass JWT tracking and org membership in this plugin. Matching is case-insensitive; invalid entries are skipped with a warning. Verdaccio remains responsible for JWT integrity and expiry. |
+| `allowList`                  | string[] | No       | Logins that may bypass JWT tracking and org checks **only if** the decoded JWT has at least one string in `groups` or `real_groups` starting with `ci-` (generated-token convention). Otherwise full checks apply. Case-insensitive usernames; invalid entries skipped with a warning. |
 
 \* At least one of `auth.github-oauth-ui.token` or `githubApp` (with `clientId` and `pem`) is required when the plugin is enabled.  
 \** Required when `githubApp` is used.
@@ -113,15 +113,20 @@ Setting `installationId` avoids the automatic org lookup and works even when the
 
 ### Allow list (`allowList`)
 
-Use `allowList` when some accounts should use the registry without this plugin enforcing org membership or single-token JWT tracking—common for **CI**, **machine users**, or **generated JWTs** where Verdaccio’s own JWT verification is enough.
+Use `allowList` for real GitHub logins that also receive **generated** JWTs (e.g. static access tokens) under the same `name`, so CI can skip org and single-session rules without letting a normal OAuth session for that user bypass checks.
 
-- After a minimal decode of the JWT payload (three segments, Base64 payload, `name` claim), if `name` is allow-listed, the plugin calls `next()` immediately: **no** JWT tracking DB updates, **no** expiry/revocation/superseded checks in this plugin, **no** org API or org cache.
-- The plugin still requires a parseable JWT and a valid `name` string. **Verdaccio** (and your auth plugin) should verify signature, `exp`, and any other claims as usual.
-- Admin “invalidate JWT” in this plugin does not apply to traffic that never enters JWT tracking; use Verdaccio/auth mechanisms to revoke those users if needed.
+**Bypass** (skip JWT tracking and org membership in this plugin) applies only when **both** are true:
+
+1. `name` is in `allowList` (case-insensitive), and  
+2. The payload has at least one string in **`groups`** or **`real_groups`** whose value starts with **`ci-`** (e.g. `ci-readonly`, `ci-readwrite` as produced by **verdaccio-static-access-token**).
+
+If the user is allow-listed but the JWT has no `ci-` group (typical browser OAuth JWT), the plugin runs the usual JWT tracking and GitHub org checks. **Verdaccio** still validates the JWT for all requests.
+
+Admin “invalidate JWT” in this plugin does not affect requests that bypass JWT tracking; revoke static tokens or machine access at the source if needed.
 
 ## JWT tracking (single token per user)
 
-When `jwtTrackingEnabled` is `true` (and the user is **not** on `allowList`):
+When `jwtTrackingEnabled` is `true` (and the request is **not** allow-listed **with** a `ci-` group in the JWT):
 
 - The plugin stores the latest JWT per user (by hash and `iat`) in a SQLite database at `~/.verdaccio/jwt-tracking.db`.
 - Only that latest token is accepted; any older token for the same user returns `401` with “JWT token has been superseded by a newer login”.
@@ -164,7 +169,7 @@ Use this to force re-validation against GitHub on the next request (e.g. after o
 1. **No `Authorization` header**: Request passes through; no verification.
 2. **Invalid or non-JWT `Authorization`**: Request passes through (plugin only validates JWTs it can parse).
 3. **Valid JWT** (three segments, decodable payload, valid `name`):
-  - If the username is in `allowList` → `next()` immediately (no JWT tracking or org logic in this plugin; Verdaccio validates the token).
+  - If the username is in `allowList` **and** some entry in `groups` or `real_groups` starts with `ci-` → `next()` immediately (no JWT tracking or org logic here; Verdaccio validates the token).
   - If JWT tracking is enabled: check single-token-per-user and revocation; reject if superseded or revoked.
   - If the username is in the cache and allowed → allow request.
   - If the username is in the cache and disallowed → `401` “GitHub authorization revoked”.
