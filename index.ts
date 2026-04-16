@@ -64,8 +64,9 @@ interface PluginConfig {
    */
   jwtCleanupSchedule?: string;
   /**
-   * GitHub usernames (login) that skip the org membership API check. Matching is case-insensitive.
-   * JWT shape, expiry, and JWT tracking (if enabled) still apply. Use for CI or bot accounts that are not org members.
+   * GitHub usernames (login) that skip this plugin’s JWT tracking and org membership checks. Matching is case-insensitive.
+   * The payload is only decoded to read `name`; Verdaccio is responsible for verifying the JWT (signature, expiry, etc.).
+   * Use for CI or bot accounts that are not org members or use generated tokens.
    */
   allowList?: string[];
 }
@@ -145,7 +146,7 @@ class GithubOAuthVerifierMiddleware {
     }
     if (this.allowList.size > 0) {
       this.stuff.logger.info(
-        `${LOG_TAG} allowList enabled (${this.allowList.size} user(s)): org membership check skipped for those logins`
+        `${LOG_TAG} allowList enabled (${this.allowList.size} user(s)): JWT tracking and org checks skipped for those logins (Verdaccio still validates JWTs)`
       );
     }
     if (this.jwtTracking) {
@@ -431,14 +432,22 @@ class GithubOAuthVerifierMiddleware {
         const payloadBase64 = tokenParts[1];
         const decodedPayload = JSON.parse(Buffer.from(payloadBase64, 'base64').toString('utf8'));
         const usernameRaw = typeof decodedPayload.name === 'string' ? decodedPayload.name.trim() : '';
-        const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;
-        const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
 
         if (!isValidUsername(usernameRaw)) {
           this.logDebug(`Rejecting token: invalid or missing username in payload`);
           return res.status(401).json({ error: 'Invalid token' });
         }
         const username = usernameRaw;
+
+        if (this.isAllowListed(username)) {
+          this.logDebug(
+            `Allow-listed user "${username}": skipping JWT tracking and org checks (Verdaccio validates the JWT)`
+          );
+          return next();
+        }
+
+        const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;
+        const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
 
         this.logDebug(`JWT payload: ${JSON.stringify(decodedPayload)}`);
         this.logDebug(`Verifying user="${username}" iat=${iat} exp=${exp}`);
@@ -487,13 +496,6 @@ class GithubOAuthVerifierMiddleware {
             );
           }
           this.jwtTracking.setLatest(username, tokenHash, iat, expForDb, 0);
-        }
-
-        if (this.isAllowListed(username)) {
-          this.logDebug(
-            `Allow-listed user "${username}": skipping org membership cache/API (still subject to JWT rules above)`
-          );
-          return next();
         }
 
         if (this.cache.has(username)) {
