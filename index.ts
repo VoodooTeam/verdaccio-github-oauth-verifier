@@ -11,20 +11,22 @@ import { JwtTrackingDb } from './jwt-tracking';
 /** Reusable tag for plugin log messages (e.g. for filtering in log aggregation). */
 const LOG_TAG = '[verdaccio-github-oauth-verifier]';
 
-/** Max length for username (used in DB and cache); avoids abuse and aligns with common limits. */
-const MAX_USERNAME_LENGTH = 256;
-
-/** Control characters and null byte – must not appear in usernames passed to DB/cache. */
-const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+/** Minimum length for adminToken (high-privilege: can revoke any user's JWT / clear caches). */
+const MIN_ADMIN_TOKEN_LENGTH = 32;
 
 /**
- * Returns true if the value is a safe username for use in DB/cache (defense in depth against injection).
- * Call this for any user-supplied username before passing to jwtTracking or cache.
+ * GitHub login rules: 1–39 chars, alphanumerics and single hyphens, may not start/end with hyphen.
+ * https://docs.github.com/en/enterprise-cloud@latest/admin/identity-and-access-management/iam-configuration-reference/username-considerations-for-external-authentication
+ */
+const GITHUB_USERNAME = /^[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$/;
+
+/**
+ * Returns true if the value is a valid GitHub login (defense in depth against injection and
+ * path-traversal via the GitHub API URL).
  */
 function isValidUsername(value: string | null): value is string {
   if (value === null || typeof value !== 'string') return false;
-  const s = value.trim();
-  return s.length > 0 && s.length <= MAX_USERNAME_LENGTH && !CONTROL_CHARS.test(s);
+  return GITHUB_USERNAME.test(value.trim());
 }
 
 /** Groups added by generated tokens (e.g. verdaccio-static-access-token) use this prefix. */
@@ -108,6 +110,38 @@ interface GithubAppConfigLoaded {
   installationId?: number;
 }
 
+interface StorageConfig {
+  config: {
+    secret?: string;
+    security?: {
+      api?: {
+        jwt?: {
+          secret?: string;
+        };
+      };
+    };
+  };
+}
+
+/** Constant-time verification of an HS256 JWT signature. */
+function verifyHs256Signature(token: string, secret: string): boolean {
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  const [headerB64, payloadB64, signatureB64] = parts;
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(`${headerB64}.${payloadB64}`)
+    .digest();
+  let presented: Buffer;
+  try {
+    presented = Buffer.from(signatureB64, 'base64url');
+  } catch {
+    return false;
+  }
+  if (presented.length !== expected.length) return false;
+  return crypto.timingSafeEqual(presented, expected);
+}
+
 class GithubOAuthVerifierMiddleware {
   private readonly stuff: PluginStuff;
   private readonly enabled: boolean;
@@ -137,7 +171,7 @@ class GithubOAuthVerifierMiddleware {
     this.stuff.logger.info(`${LOG_TAG} Configuring`);
 
     this.enabled = config != null && config.enabled !== false;
-    this.cache = new LRUCache({ max: 1000, ttl: config?.cacheTTLMinutes ? config.cacheTTLMinutes * 60 * 1000 : 1000 * 60 * 60 * 8 });
+    this.cache = new LRUCache({ max: 1000, ttl: config?.cacheTTLMinutes ? config.cacheTTLMinutes * 60 * 1000 : 1000 * 60 * 60 * 2 });
 
     if (config?.jwtTrackingEnabled === true) {
       try {
@@ -212,6 +246,11 @@ class GithubOAuthVerifierMiddleware {
     }
 
     this.adminToken = config?.adminToken?.trim() ?? '';
+    if (this.adminToken && this.adminToken.length < MIN_ADMIN_TOKEN_LENGTH) {
+      throw new Error(
+        `${LOG_TAG} adminToken is too short. Must be at least ${MIN_ADMIN_TOKEN_LENGTH} characters long.`
+      );
+    }
     if (hasGitHubApp && githubAppConfig) {
       try {
         const pem = loadPem(githubAppConfig.pem);
@@ -262,12 +301,11 @@ class GithubOAuthVerifierMiddleware {
       }
     };
 
-    let expression = this.jwtCleanupSchedule;
+    const expression = this.jwtCleanupSchedule;
     if (!cron.validate(expression)) {
-      this.stuff.logger.warn(
-        `${LOG_TAG} Invalid jwtCleanupSchedule "${expression}", using default "0 0 * * *"`
+      throw new Error(
+        `${LOG_TAG} Invalid jwtCleanupSchedule "${expression}". Fix config or omit for default "0 0 * * *".`
       );
-      expression = '0 0 * * *';
     }
     this.cleanupTask = cron.schedule(expression, runCleanup);
   }
@@ -370,7 +408,7 @@ class GithubOAuthVerifierMiddleware {
       post?: (path: string, ...handlers: Array<(req: Request, res: Response, next: NextFunction) => void>) => void;
     },
     _authInstance: unknown,
-    storageInstance: unknown
+    storageInstance: StorageConfig
   ): void {
     if (!this.enabled) {
       return;
@@ -379,6 +417,17 @@ class GithubOAuthVerifierMiddleware {
     if (!this.org || (!this.token && !this.useGitHubApp)) {
       this.stuff.logger.error(
         `${LOG_TAG} org or auth (token or GitHub App) is missing, skipping middleware setup`
+      );
+      return;
+    }
+
+    const verdaccioSecret =
+      storageInstance?.config?.security?.api?.jwt?.secret ??
+      storageInstance?.config?.secret ??
+      '';
+    if (!verdaccioSecret) {
+      this.stuff.logger.error(
+        `${LOG_TAG} No Verdaccio JWT secret available (security.api.jwt.secret or secret); cannot verify JWT signatures, skipping middleware setup`
       );
       return;
     }
@@ -449,8 +498,13 @@ class GithubOAuthVerifierMiddleware {
         const tokenParts = token.split('.');
         if (tokenParts.length !== 3) return next();
 
+        if (!verifyHs256Signature(token, verdaccioSecret)) {
+          this.logDebug('Rejecting token: invalid HS256 signature');
+          return res.status(401).json({ error: 'Invalid token' });
+        }
+
         const payloadBase64 = tokenParts[1];
-        const decodedPayload = JSON.parse(Buffer.from(payloadBase64, 'base64').toString('utf8'));
+        const decodedPayload = JSON.parse(Buffer.from(payloadBase64, 'base64url').toString('utf8'));
         const usernameRaw = typeof decodedPayload.name === 'string' ? decodedPayload.name.trim() : '';
 
         if (!isValidUsername(usernameRaw)) {
@@ -473,10 +527,19 @@ class GithubOAuthVerifierMiddleware {
         }
 
         const iat = typeof decodedPayload.iat === 'number' ? decodedPayload.iat : 0;
-        const exp = typeof decodedPayload.exp === 'number' ? decodedPayload.exp : null;
+        if (typeof decodedPayload.exp !== 'number') {
+          this.logDebug(`Denying: JWT for user "${username}" missing exp claim`);
+          return res.status(401).json({ error: 'JWT token missing exp claim' });
+        }
+        const exp: number = decodedPayload.exp;
 
-        this.logDebug(`JWT payload: ${JSON.stringify(decodedPayload)}`);
         this.logDebug(`Verifying user="${username}" iat=${iat} exp=${exp}`);
+
+        if (exp < Math.floor(Date.now() / 1000)) {
+          this.logDebug(`Denying: JWT token has expired for user "${username}"`);
+          this.jwtTracking?.deleteUser(username);
+          return res.status(401).json({ error: 'JWT token has expired' });
+        }
 
         if (this.jwtTracking) {
           const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
@@ -497,12 +560,6 @@ class GithubOAuthVerifierMiddleware {
             }
           }
 
-          if (exp !== null && exp < Math.floor(Date.now() / 1000)) {
-            this.logDebug(`Denying: JWT token has expired for user "${username}"`);
-            this.jwtTracking.deleteUser(username);
-            return res.status(401).json({ error: 'JWT token has expired' });
-          }
-
           if (latest !== null && !latest.revoked && iat < latest.iat) {
             this.logDebug(
               `Denying: token superseded (iat=${iat} < latest.iat=${latest.iat}) for user "${username}"`
@@ -510,7 +567,6 @@ class GithubOAuthVerifierMiddleware {
             return res.status(401).json({ error: 'JWT token has been superseded by a newer login' });
           }
 
-          const expForDb = exp !== null ? exp : 2147483647; // no expiry → far future for cleanup
           const isNewJwt =
             latest === null ||
             latest.token_hash !== tokenHash ||
@@ -521,7 +577,7 @@ class GithubOAuthVerifierMiddleware {
               `Cleared org-verification cache for "${username}" (new or changed JWT, re-verify against GitHub)`
             );
           }
-          this.jwtTracking.setLatest(username, tokenHash, iat, expForDb, 0);
+          this.jwtTracking.setLatest(username, tokenHash, iat, exp, 0);
         }
 
         if (this.cache.has(username)) {
@@ -569,24 +625,33 @@ class GithubOAuthVerifierMiddleware {
     }
 
     try {
-      const response = await fetch(`https://api.github.com/orgs/${orgName}/members/${username}`, {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: 'application/vnd.github.v3+json',
-          'X-GitHub-Api-Version': '2022-11-28'
+      const response = await fetch(
+        `https://api.github.com/orgs/${encodeURIComponent(orgName)}/members/${encodeURIComponent(username)}`,
+        {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/vnd.github.v3+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+          }
         }
-      });
+      );
 
       // 204 means the user is confirmed as a member
       if (response.status === 204) {
-        return true; 
+        return true;
       }
-      
+
       // 404 means they were removed or never existed
       if (response.status === 404) {
         this.stuff.logger.warn(`${LOG_TAG} User ${username} is no longer in the ${orgName} organization.`);
         return false;
+      }
+
+      // 401/403 likely indicate the bearer is stale or revoked — drop the cached installation
+      // token so the next call re-mints one via the App JWT.
+      if (this.useGitHubApp && (response.status === 401 || response.status === 403)) {
+        this.installationTokenCache = null;
       }
 
       // Log unexpected statuses (e.g., 401 Unauthorized if your token expires, or 403 Rate Limit)
@@ -602,18 +667,19 @@ class GithubOAuthVerifierMiddleware {
 
   private requireAdminToken(req: Request, res: Response, next: NextFunction): void {
     const auth = req.headers?.authorization;
-    this.logDebug(
-      `requireAdminToken: Authorization=${auth === undefined ? '(missing)' : JSON.stringify(auth)}`
-    );
-    this.logDebug(`requireAdminToken: configured adminToken=${JSON.stringify(this.adminToken)}`);
+    this.logDebug(`requireAdminToken: Authorization header ${auth === undefined ? 'missing' : 'present'}`);
     if (!auth || !auth.startsWith('Bearer ')) {
       res.status(401).json({ error: 'Missing or invalid Authorization header (Bearer token required)' });
       return;
     }
-    const token = auth.split(' ')[1];
-    this.logDebug(`requireAdminToken: presented Bearer token=${JSON.stringify(token)}`);
-    if (token !== this.adminToken) {
-      this.logDebug('requireAdminToken: token mismatch (presented !== configured adminToken)');
+    const token = auth.split(' ')[1] ?? '';
+    const presented = Buffer.from(token);
+    const expected = Buffer.from(this.adminToken);
+    if (
+      presented.length !== expected.length ||
+      !crypto.timingSafeEqual(presented, expected)
+    ) {
+      this.logDebug('requireAdminToken: token mismatch');
       res.status(403).json({ error: 'Invalid admin token' });
       return;
     }

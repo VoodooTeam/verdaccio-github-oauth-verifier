@@ -17,6 +17,7 @@ A [Verdaccio](https://verdaccio.org/) auth plugin that verifies JWT tokens issue
 
 - Verdaccio 3.x
 - An auth plugin that issues JWTs with a `name` claim (e.g. **verdaccio-github-oauth-ui**). This plugin does not issue tokens; it only verifies them.
+- A Verdaccio JWT secret (`security.api.jwt.secret` or top-level `secret`) — required. The plugin verifies the HS256 signature of every JWT before acting on its payload and will refuse to register its middleware if no secret is configured.
 
 ## Installation
 
@@ -47,8 +48,8 @@ middlewares:
     #   pem: "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
     #   installationId: 12345  # optional; resolved from org if omitted
     # adminToken: "optional-token-for-admin-endpoints-when-using-github-app-only"
-    adminToken: "super-secret-token-for-admin-endpoints"
-    cacheTTLMinutes: 480
+    adminToken: "super-secret-token-for-admin-endpoints-min-32-chars"
+    cacheTTLMinutes: 120
     jwtTrackingEnabled: true
     jwtCleanupSchedule: "0 0 * * *"
     # Optional: these logins skip JWT tracking + org only if JWT has a group starting with ci- (groups / real_groups).
@@ -68,10 +69,10 @@ middlewares:
 | `githubApp.clientId`         | string  | Yes**    | GitHub App ID (numeric, from app settings). Required when using `githubApp`.                                                                                            |
 | `githubApp.pem`              | string  | Yes**    | Private key: PEM content (multi-line string) or path to a `.pem` file. Required when using `githubApp`.                                                                 |
 | `githubApp.installationId`   | number  | No       | Installation ID for the org. If omitted, the plugin resolves it via `GET /orgs/{org}/installation`.                                                                     |
-| `adminToken`                 | string  | No       | Token for admin endpoints. When using GitHub App only (no `auth.github-oauth-ui.token`), set this to protect admin routes. Otherwise admin uses the same token.         |
-| `cacheTTLMinutes`            | number  | No       | How long to cache verification results (minutes). Default: `480` (8 hours).                                                                                             |
-| `jwtTrackingEnabled`         | boolean | No       | When `true`, enable JWT tracking (only the most recent JWT per user). DB is stored at `~/.verdaccio/jwt-tracking.db`.                                                   |
-| `jwtCleanupSchedule`         | string  | No       | Cron expression for cleanup of expired JWT tracking rows. Default: `0 0 * * *` (daily at midnight). Format: 5 fields `minute hour day month weekday` or 6 with seconds. |
+| `adminToken`                 | string  | No       | Token for admin endpoints. When using GitHub App only (no `auth.github-oauth-ui.token`), set this to protect admin routes. Otherwise admin uses the same token. **Must be at least 32 characters** when set; startup fails otherwise. |
+| `cacheTTLMinutes`            | number  | No       | How long to cache verification results (minutes). Default: `120` (2 hours).                                                                                             |
+| `jwtTrackingEnabled`         | boolean | No       | When `true`, enable JWT tracking (only the most recent JWT per user). DB is stored at `~/.verdaccio/jwt-tracking.db` with owner-only permissions (`0600`).              |
+| `jwtCleanupSchedule`         | string  | No       | Cron expression for cleanup of expired JWT tracking rows. Default: `0 0 * * *` (daily at midnight). Format: 5 fields `minute hour day month weekday` or 6 with seconds. Invalid expressions fail at startup. |
 | `allowList`                  | string[] | No       | Logins that may bypass JWT tracking and org checks **only if** the decoded JWT has at least one string in `groups` or `real_groups` starting with `ci-` (generated-token convention). Otherwise full checks apply. Case-insensitive usernames; invalid entries skipped with a warning. |
 
 \* At least one of `auth.github-oauth-ui.token` or `githubApp` (with `clientId` and `pem`) is required when the plugin is enabled.  
@@ -167,8 +168,11 @@ Use this to force re-validation against GitHub on the next request (e.g. after o
 ## Behavior summary
 
 1. **No `Authorization` header**: Request passes through; no verification.
-2. **Invalid or non-JWT `Authorization`**: Request passes through (plugin only validates JWTs it can parse).
-3. **Valid JWT** (three segments, decodable payload, valid `name`):
+2. **Non-JWT `Authorization`** (not three base64url segments): Request passes through (plugin only inspects parseable JWTs).
+3. **JWT with invalid HS256 signature** against the Verdaccio secret: `401`. No tracking DB or cache side effects.
+4. **JWT missing `exp` claim**: `401`. All accepted JWTs must carry an expiry.
+5. **JWT with invalid `name`** (not a valid GitHub login — 1–39 chars, alphanumerics and single internal hyphens): `401`.
+6. **Valid, signed, unexpired JWT with valid `name`**:
   - If the username is in `allowList` **and** some entry in `groups` or `real_groups` starts with `ci-` → `next()` immediately (no JWT tracking or org logic here; Verdaccio validates the token).
   - If JWT tracking is enabled: check single-token-per-user and revocation; reject if superseded or revoked.
   - If the username is in the cache and allowed → allow request.
@@ -176,6 +180,8 @@ Use this to force re-validation against GitHub on the next request (e.g. after o
   - Otherwise: call GitHub API `GET /orgs/{org}/members/{username}`. If `204` → allow and cache; if `404` (or other failure) → deny, cache denial, and optionally mark as revoked in JWT tracking.
 
 Errors talking to GitHub or invalid tokens are treated as “fail closed”: access is denied.
+
+The admin endpoints use `crypto.timingSafeEqual` for the `adminToken` check and never log token values.
 
 ## License
 

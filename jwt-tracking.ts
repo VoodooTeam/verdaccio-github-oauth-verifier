@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import fs from 'fs';
 import path from 'path';
 
 const TABLE = `CREATE TABLE IF NOT EXISTS jwt_tracking (
@@ -23,15 +24,30 @@ export class JwtTrackingDb {
   private db: Database.Database;
 
   constructor(dbPath: string) {
+    // Callers (see index.ts) always pass an absolute path under ~/.verdaccio. The
+    // process.cwd() branch is a defensive fallback for any hypothetical direct use of
+    // this class with a relative path; do not rely on it from plugin code.
     const resolved = path.isAbsolute(dbPath) ? dbPath : path.resolve(process.cwd(), dbPath);
     this.db = new Database(resolved);
+    // Token hashes + usernames — restrict to owner (read/write). Called every init so
+    // perms are corrected if the file was created with a laxer umask previously.
+    try {
+      fs.chmodSync(resolved, 0o600);
+    } catch {
+      /* non-fatal: filesystem may not support chmod (e.g. some network FS) */
+    }
     this.db.pragma('journal_mode = WAL');
     this.db.exec(TABLE);
     this.db.exec(INDEX_EXP);
     try {
       this.db.exec(`ALTER TABLE jwt_tracking ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0`);
-    } catch {
-      /* column already exists (e.g. after upgrade) */
+    } catch (err) {
+      // Only swallow the "column already exists" case from an older schema. Anything
+      // else (disk error, corruption, locked DB) must surface.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/duplicate column name/i.test(msg)) {
+        throw err;
+      }
     }
   }
 
