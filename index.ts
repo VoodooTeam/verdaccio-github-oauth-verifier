@@ -33,6 +33,20 @@ function isValidUsername(value: string | null): value is string {
 const CI_GROUP_PREFIX = 'ci-';
 
 /**
+ * Path prefix used by the Verdaccio web UI for its data/heartbeat endpoints. Requests under this
+ * prefix carry a short-lived web JWT (security.web.sign), not the long-lived API JWT (security.api.jwt)
+ * that npm CLI uses. Web-session writes must not pollute JWT tracking, otherwise the newer web `iat`
+ * supersedes the user's CLI token and the next `npm` call is rejected.
+ */
+const WEB_UI_PATH_PREFIX = '/-/verdaccio/';
+
+/** True if this is a Verdaccio web UI request (carries the web JWT, not the npm CLI's API JWT). */
+function isWebUiRequest(req: Request): boolean {
+  const target = req.path ?? req.url ?? '';
+  return target.startsWith(WEB_UI_PATH_PREFIX);
+}
+
+/**
  * True if the decoded JWT payload includes at least one group string starting with {@link CI_GROUP_PREFIX}
  * in `groups` or `real_groups` (convention for machine / static-token JWTs).
  */
@@ -541,12 +555,14 @@ class GithubOAuthVerifierMiddleware {
           return res.status(401).json({ error: 'JWT token has expired' });
         }
 
+        const webUi = isWebUiRequest(req);
+
         if (this.jwtTracking) {
           const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
           const latest = this.jwtTracking.getLatest(username);
 
           this.logDebug(
-            `JWT tracking: latest=${latest === null ? 'null' : `{ revoked=${!!latest.revoked}, iat=${latest.iat} }`}`
+            `JWT tracking: latest=${latest === null ? 'null' : `{ revoked=${!!latest.revoked}, iat=${latest.iat} }`} webUi=${webUi}`
           );
 
           if (latest !== null && latest.revoked) {
@@ -560,24 +576,30 @@ class GithubOAuthVerifierMiddleware {
             }
           }
 
-          if (latest !== null && !latest.revoked && iat < latest.iat) {
-            this.logDebug(
-              `Denying: token superseded (iat=${iat} < latest.iat=${latest.iat}) for user "${username}"`
-            );
-            return res.status(401).json({ error: 'JWT token has been superseded by a newer login' });
-          }
+          if (!webUi) {
+            if (latest !== null && !latest.revoked && iat < latest.iat) {
+              this.logDebug(
+                `Denying: token superseded (iat=${iat} < latest.iat=${latest.iat}) for user "${username}"`
+              );
+              return res.status(401).json({ error: 'JWT token has been superseded by a newer login' });
+            }
 
-          const isNewJwt =
-            latest === null ||
-            latest.token_hash !== tokenHash ||
-            latest.iat !== iat;
-          if (isNewJwt) {
-            this.cache.delete(username);
+            const isNewJwt =
+              latest === null ||
+              latest.token_hash !== tokenHash ||
+              latest.iat !== iat;
+            if (isNewJwt) {
+              this.cache.delete(username);
+              this.logDebug(
+                `Cleared org-verification cache for "${username}" (new or changed JWT, re-verify against GitHub)`
+              );
+            }
+            this.jwtTracking.setLatest(username, tokenHash, iat, exp, 0);
+          } else {
             this.logDebug(
-              `Cleared org-verification cache for "${username}" (new or changed JWT, re-verify against GitHub)`
+              `Web UI request (${req.path}): skipping supersede check and setLatest write so the short-lived web JWT does not invalidate the user's CLI token`
             );
           }
-          this.jwtTracking.setLatest(username, tokenHash, iat, exp, 0);
         }
 
         if (this.cache.has(username)) {
